@@ -10,6 +10,7 @@ key 只从环境变量读，绝不打进日志。
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
@@ -134,6 +135,181 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
+# ---------------------------------------------------------------------------
+# Application-owned response validation (fail-closed).
+#
+# A provider only proves it speaks HTTP with code == 0; it does not prove the
+# answers are well-formed.  engine.analyze() treats any answers dict it receives
+# as a successful judgment, so malformed choice/score payloads would otherwise
+# flow into guidance_text() and silently degrade ranking to "first candidate /
+# zero probabilities".  Validate against the EXACT questions we requested and
+# raise JevError on any mismatch; the engine already turns that into its normal
+# network/schema-failure fallback.  Nothing here coerces bad data into defaults.
+# ---------------------------------------------------------------------------
+
+# Probability distributions "sum to approximately 1" per the TypeSafe/Jev
+# contract.  Tolerate provider rounding (e.g. three 0.3333 bins -> 0.9999);
+# a genuinely wrong total such as 0.98 is still rejected.
+_PROB_SUM_TOLERANCE = 1e-3
+
+
+def _is_finite_number(value) -> bool:
+    """True only for real int/float (bool excluded) that is not NaN/±Infinity."""
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _require_unit_interval(value, qid: str, field: str) -> float:
+    """Validate a noul / confidence / probability value: finite number in [0, 1]."""
+    if not _is_finite_number(value):
+        raise JevError(
+            f"JevAI answer {qid!r}: {field} must be a finite number, got {value!r}")
+    number = float(value)
+    if not 0.0 <= number <= 1.0:
+        raise JevError(
+            f"JevAI answer {qid!r}: {field} must be within [0, 1], got {number!r}")
+    return number
+
+
+def _validate_distribution(probabilities, ordered_keys: list, qid: str) -> dict:
+    """Validate a choice/score probability map against the exact allowed keys.
+
+    Every allowed key must be present (complete distribution), no unknown keys
+    are accepted, and each value is finite in [0, 1] with the total ~= 1.
+    Returns the distribution normalized to float values in canonical key order.
+    """
+    if not isinstance(probabilities, dict):
+        raise JevError(
+            f"JevAI answer {qid!r}: probabilities must be an object, "
+            f"got {type(probabilities).__name__}")
+    allowed = list(ordered_keys)
+    allowed_set = set(allowed)
+    found = set(probabilities)
+    missing = sorted(allowed_set - found)
+    unknown = sorted(found - allowed_set)
+    if missing:
+        raise JevError(
+            f"JevAI answer {qid!r}: probabilities missing keys {missing}")
+    if unknown:
+        raise JevError(
+            f"JevAI answer {qid!r}: probabilities have unknown keys {unknown}")
+    normalized: dict = {}
+    total = 0.0
+    for key in allowed:
+        probability = _require_unit_interval(probabilities[key], qid,
+                                             f"probabilities[{key!r}]")
+        normalized[key] = probability
+        total += probability
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=_PROB_SUM_TOLERANCE):
+        raise JevError(
+            f"JevAI answer {qid!r}: probabilities must sum to ~1, got {total!r}")
+    return normalized
+
+
+def _validate_answers(questions: dict, answers: dict) -> dict:
+    """Fail-closed validation of one JevAI ``answers`` payload.
+
+    ``questions`` is the exact question dict sent in this request; ``answers``
+    is the provider's ``data.answers``.  Returns a normalized, provider-
+    independent answers dict with the same shape the other providers produce:
+
+    - noul:   {"type": "noul", "noul": float}
+    - choice: {"type": "choice", "choice": str, "confidence": float,
+               "probabilities": {choice_key: float}}
+    - score:  {"type": "score", "score": float, "confidence": float,
+               "probabilities": {"0".."n-1": float}}
+
+    Raises JevError on any structural or value-level violation.
+    """
+    if not isinstance(questions, dict):
+        raise JevError("JevAI validation: requested questions must be an object")
+    if not isinstance(answers, dict):
+        raise JevError("JevAI response: answers must be an object keyed by question id")
+
+    requested = set(questions)
+    received = set(answers)
+    missing = sorted(requested - received)
+    unknown = sorted(received - requested)
+    if missing:
+        raise JevError(f"JevAI response is missing answers: {missing}")
+    if unknown:
+        raise JevError(f"JevAI response contains unknown answers: {unknown}")
+
+    normalized: dict = {}
+    for qid, question in questions.items():
+        if not isinstance(question, dict) or "type" not in question:
+            # Questions are application-owned; an unreadable one is our bug, but
+            # fail closed rather than trust the provider against an unknown schema.
+            raise JevError(f"JevAI validation: question {qid!r} is malformed")
+        answer = answers[qid]
+        if not isinstance(answer, dict):
+            raise JevError(f"JevAI answer {qid!r} must be an object, got {type(answer).__name__}")
+
+        qtype = question["type"]
+        if answer.get("type") != qtype:
+            raise JevError(
+                f"JevAI answer {qid!r}: expected type {qtype!r}, "
+                f"got {answer.get('type')!r}")
+        criteria = question.get("criteria")
+
+        if qtype == "noul":
+            normalized[qid] = {
+                "type": "noul",
+                "noul": _require_unit_interval(answer.get("noul"), qid, "noul"),
+            }
+
+        elif qtype == "choice":
+            if not isinstance(criteria, dict) or not criteria:
+                raise JevError(
+                    f"JevAI validation: choice question {qid!r} needs a non-empty "
+                    "criteria object")
+            choice = answer.get("choice")
+            if not isinstance(choice, str) or choice not in criteria:
+                raise JevError(
+                    f"JevAI answer {qid!r}: choice {choice!r} is not one of "
+                    f"{list(criteria)}")
+            confidence = _require_unit_interval(answer.get("confidence"), qid, "confidence")
+            probabilities = _validate_distribution(
+                answer.get("probabilities"), list(criteria), qid)
+            normalized[qid] = {
+                "type": "choice",
+                "choice": choice,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            }
+
+        elif qtype == "score":
+            # Score criteria is an ordered list of levels numbered 0..n-1.
+            if not isinstance(criteria, list) or len(criteria) < 2:
+                raise JevError(
+                    f"JevAI validation: score question {qid!r} needs a criteria list "
+                    "of at least two levels")
+            top = len(criteria) - 1
+            score = answer.get("score")
+            if not _is_finite_number(score):
+                raise JevError(
+                    f"JevAI answer {qid!r}: score must be a finite number, got {score!r}")
+            score = float(score)
+            if not 0.0 <= score <= top:
+                raise JevError(
+                    f"JevAI answer {qid!r}: score {score!r} outside domain [0, {top}]")
+            confidence = _require_unit_interval(answer.get("confidence"), qid, "confidence")
+            probabilities = _validate_distribution(
+                answer.get("probabilities"), [str(i) for i in range(top + 1)], qid)
+            normalized[qid] = {
+                "type": "score",
+                "score": score,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            }
+
+        else:
+            raise JevError(
+                f"JevAI validation: question {qid!r} has unsupported type {qtype!r}")
+
+    return normalized
+
 
 def _ask_jevai(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
     """JevAI Community native Decisions adapter.
@@ -179,6 +355,11 @@ def _ask_jevai(state: dict, questions: dict, key: str, model: str, timeout: floa
             answers = data.get("answers")
             if not isinstance(answers, dict):
                 raise JevError("JevAI response missing data.answers")
+
+            # Fail closed: validate against the exact questions we sent before any
+            # answer can reach the engine.  A malformed payload raises JevError here
+            # (never retried, never coerced), so the engine takes its normal fallback.
+            answers = _validate_answers(questions, answers)
 
             usage = data.get("usage")
             return {
@@ -414,23 +595,37 @@ if __name__ == "__main__":
     assert seen["body"]["model"] == "typesafe/jev-1.13" and seen["body"]["questions"] == questions
 
     # JevAI Community uses the same state/questions payload but wraps answers in
-    # {code, message, data}; the adapter must normalize that envelope.
+    # {code, message, data}; the adapter normalizes that envelope AND fail-closed
+    # validates every answer against the exact questions we sent.
+    def _valid_jevai_answers(qs: dict) -> dict:
+        """A schema-valid answer set for any questions dict (peaked distributions)."""
+        out = {}
+        for name, q in qs.items():
+            kind = q["type"]
+            if kind == "noul":
+                out[name] = {"type": "noul", "noul": 0.8}
+            elif kind == "choice":
+                keys = list(q["criteria"])
+                out[name] = {
+                    "type": "choice", "choice": keys[0], "confidence": 1.0,
+                    "probabilities": {k: (1.0 if k == keys[0] else 0.0) for k in keys},
+                }
+            else:  # score：criteria 是有序 level 列表，概率 key 是字符串序号 0..n-1
+                levels = len(q["criteria"])
+                peak = min(4, levels - 1)
+                out[name] = {
+                    "type": "score", "score": float(peak), "confidence": 1.0,
+                    "probabilities": {str(i): (1.0 if i == peak else 0.0)
+                                      for i in range(levels)},
+                }
+        return out
+
+    jevai_answers = _valid_jevai_answers(questions)
     jevai_body = {
         "code": 0,
         "message": "ok",
         "data": {
-            "answers": {
-                "best_reply": {
-                    "type": "choice",
-                    "choice": "reply_b",
-                    "confidence": 0.8,
-                    "probabilities": {
-                        "reply_a": 0.1,
-                        "reply_b": 0.8,
-                        "reply_c": 0.1,
-                    },
-                }
-            },
+            "answers": jevai_answers,
             "usage": {"input_tokens": 7, "output_tokens": 0},
         },
     }
@@ -451,11 +646,51 @@ if __name__ == "__main__":
     assert seen["jevai_auth"] == "Bearer ts-key"
     assert seen["jevai_body"]["model"] == "typesafe-ai/jev"
     assert seen["jevai_body"]["questions"] == questions
+    # 校验 + 归一化后仍是 provider-independent 的同一形状（legend 等多余字段不带进 engine）
     assert got == {
-        "answers": jevai_body["data"]["answers"],
+        "answers": _valid_jevai_answers(questions),
         "usage": jevai_body["data"]["usage"],
     }
     assert list_models("jevai", "unused") == ["typesafe-ai/jev"]
+
+    # Fail-closed：HTTP/envelope 成功但答案畸形，必须抛 JevError，绝不静默兜底。
+    # 评审点名的四类：缺答案、多答案、选项越界、非有限概率。
+    def _expect_jevai_error(label: str, malformed: dict) -> None:
+        try:
+            _validate_answers(questions, malformed)
+        except JevError:
+            return
+        raise SystemExit(f"应当抛错: {label}")
+
+    missing = _valid_jevai_answers(questions)
+    del missing["true_intent"]
+    _expect_jevai_error("missing answer", missing)
+
+    extra = _valid_jevai_answers(questions)
+    extra["not_asked"] = {"type": "noul", "noul": 0.5}
+    _expect_jevai_error("extra answer", extra)
+
+    bad_choice = _valid_jevai_answers(questions)
+    bad_choice["best_reply"]["choice"] = "reply_z"
+    _expect_jevai_error("choice outside criteria", bad_choice)
+
+    for bad in (float("nan"), float("inf"), float("-inf"), -0.1, 1.5):
+        bad_prob = _valid_jevai_answers(questions)
+        bad_prob["best_reply"]["probabilities"]["reply_b"] = bad
+        _expect_jevai_error(f"non-finite/out-of-range probability {bad}", bad_prob)
+
+    # 端到端：code==0 但 data.answers 缺题，ask() 也得抛，不能把畸形答案交给 engine
+    bad_body = {"code": 0, "message": "ok",
+                "data": {"answers": {"best_reply": jevai_answers["best_reply"]},
+                         "usage": {}}}
+    with patch.object(urllib.request, "urlopen",
+                      lambda req, timeout=None: io.BytesIO(
+                          json.dumps(bad_body).encode("utf-8"))):
+        try:
+            ask({"chat": {}}, questions, provider="jevai")
+            raise SystemExit("应当抛错: envelope ok but answers malformed")
+        except JevError:
+            pass
 
     # OpenRouter 路的列表是写死的，但 key 要过 auth/key 探测：mock urlopen 验两头
     def _fake_key_ok(req, timeout=None):
